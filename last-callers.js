@@ -65,7 +65,7 @@ function sample(label, text) {
 
 // --- Minimal helpers (ASCII only) ---
 function say(s) { console.print((s || "") + "\r\n"); }
-function putXY(f, x, y, s, attr) { f.gotoxy(x, y); f.putmsg(String(s || ""), attr || 0); }
+function putXY(f, x, y, s, attr) { f.gotoxy(x > 0 ? x : 1, y > 0 ? y : 1); f.putmsg(String(s || ""), attr || 0); }
 function clipPad(s, w) { s = String(s || ""); if (s.length > w) return s.substr(0, w - 3) + "..."; while (s.length < w) s += " "; return s; }
 function prettyTime(epoch) {
     if (!epoch) return "--";
@@ -98,8 +98,10 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
     var header = new Frame(1, 1, parentFrame.width, 6, WHITE | BG_BLACK, parentFrame);
     var list = new Frame(1, header.height + 1, parentFrame.width, parentFrame.height - header.height - 1, TABLE_THEME.frame.list, parentFrame);
     var footer = new Frame(1, parentFrame.height, parentFrame.width, 1, TABLE_THEME.frame.footer, parentFrame);
-    var bannerX = parseInt((console.screen_columns - 79) / 2)
-    var banner = new Frame(bannerX, 1, 80, header.height, WHITE | BG_GREEN, header);
+    // Replace your banner calc with this:
+    var bannerW = Math.min(80, header.width);                     // don't exceed parent
+    var bannerX = Math.max(1, Math.floor((header.width - bannerW) / 2) + 1); // center, 1-based
+    var banner = new Frame(bannerX, 1, bannerW, header.height, WHITE | BG_GREEN, header);
 
     parentFrame.open();
 
@@ -127,7 +129,7 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
 
     // Loop - any key or hotspot click exits
     while (!js.terminated) {
-        if (parentFrame.cycle()) console.gotoxy(console.cx, console.cy);
+        if (parentFrame.cycle()) console.gotoxy(console.cx > 0 ? console.cx : 1, console.cy > 0 ? console.cy : 1);
         var k = console.inkey(K_NONE, 250);
         if (!k) continue;
         break;
