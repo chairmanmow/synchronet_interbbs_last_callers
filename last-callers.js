@@ -8,7 +8,10 @@ load("frame.js");
 // --- Config ---
 var test = "LOCAL-TEST_ADS".toLowerCase();
 var SUB_CODE = "fsx_dat";
-var LOOKBACK = 800;
+// Scan the complete retained message base.  Applying a raw-message lookback
+// before sorting lets one high-volume BBS crowd newer embedded caller records
+// out of consideration when network delivery order differs from caller time.
+var LOOKBACK = 0; // 0 = all retained messages; positive values remain useful for diagnostics
 var MATCH_FROM = "ibbslastcall";
 var MATCH_SUBJ = "ibbslastcall-data";
 var TABLE_MAX_WIDTH = 80;
@@ -32,6 +35,48 @@ var TABLE_THEME = {
 
 var OWN_ROW_ATTR = YELLOW | BG_BLACK;
 
+// --- Eye candy ---
+var ANIM_MS = 120;            // animation tick / key poll interval
+
+// Shimmering rainbow wave applied to Alias + BBS/Source of local callers.
+var SHIMMER_COLORS = [LIGHTRED, YELLOW, LIGHTGREEN, LIGHTCYAN, LIGHTBLUE, LIGHTMAGENTA];
+var SHIMMER_SPARKLE = WHITE;  // occasional bright flash riding on the wave
+var SHIMMER_SPARKLE_MOD = 23; // lower = more frequent sparkles
+
+// The banner's first/last 10 columns are avatar canvases. They start with a
+// fresh random pair and rotate through the public avatar chooser library on
+// alternating 5-second beats.
+var HEADER_AVATAR_WIDTH = 10;
+var HEADER_AVATAR_INTERVAL_MS = 5000;
+var HEADER_AVATAR_OFFSET_MS = 2500;
+var HEADER_AVATAR_DISSOLVE_MS = 900;
+
+// Color loop for the bright-red cells in the banner art. The whole banner holds a
+// single color at a time; each hue breathes dim -> bright -> dim before the next one
+// takes over, so it reads as a glow pulse rather than a rainbow.
+var GLOW_SOURCE_FG = LIGHTRED;
+var GLOW_HUES = [RED, MAGENTA, BLUE, CYAN, GREEN, BROWN];
+var GLOW_HOLD = 2;            // ticks the pulse rests at each brightness
+var GLOW_CYCLE = (function () {
+    var seq = [];
+    for (var i = 0; i < GLOW_HUES.length; i++) {
+        var dim = GLOW_HUES[i], bright = GLOW_HUES[i] | HIGH;
+        var ramp = [dim, bright, bright, dim];
+        for (var r = 0; r < ramp.length; r++)
+            for (var h = 0; h < GLOW_HOLD; h++) seq.push(ramp[r]);
+    }
+    return seq;
+})();
+
+// Avatars are avatar_lib.defs sized (10x6); a 12-column gutter holds one plus padding.
+var AVATAR_GUTTER = 12;
+var AVATAR_BASE_COLS = 80;    // widths beyond this, in AVATAR_GUTTER steps, buy avatar lanes
+var AVATAR_MAX_LANES = 2;     // 1 lane = right side only, 2 = alternate sides
+
+// Indexes into the view's colWidths/headers (Time | Alias | Location | BBS/Source)
+var COL_ALIAS = 1;
+var COL_SOURCE = 3;
+
 var CP437 = {
     horiz: "\xC4",
     vert: "\xB3",
@@ -47,7 +92,7 @@ var CP437 = {
 };
 
 // --- Debug control ---
-var DEBUG = true;
+var DEBUG = false;
 var DEBUG_MAX = 300;
 
 function devlog(s) {
@@ -90,6 +135,29 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
         typeof console.add_hotspot === "function" &&
         typeof console.clear_hotspots === "function");
 
+    // Everything below is decoration; a terminal without ANSI just gets the plain table.
+    var SUPPORTS_ANSI = true;
+    try { SUPPORTS_ANSI = !!console.term_supports(USER_ANSI); } catch (e) { SUPPORTS_ANSI = true; }
+
+    // Each full AVATAR_GUTTER of width past 80 columns buys one avatar lane.
+    var avatarLanes = Math.max(0, Math.min(AVATAR_MAX_LANES,
+        Math.floor((console.screen_columns - AVATAR_BASE_COLS) / AVATAR_GUTTER)));
+
+    var avatarLib = null;
+    if (SUPPORTS_ANSI) {
+        try { avatarLib = load({}, "avatar_lib.js"); } catch (e) { devlog("avatar_lib load failed: " + e); }
+        if (avatarLib && avatarLib.defs &&
+            (avatarLib.defs.width !== HEADER_AVATAR_WIDTH || avatarLib.defs.height !== 6)) avatarLib = null;
+    }
+    if (!avatarLib) avatarLanes = 0;
+    devlog("cols=" + console.screen_columns + " avatarLanes=" + avatarLanes + " ansi=" + SUPPORTS_ANSI);
+
+    // Cells the animation loop repaints each tick.
+    var shimmerCells = [];  // Alias/Source characters of local callers
+    var glowCells = [];     // the bright-red cells of the banner art
+    var avatarCache = Object.create(null);
+    var bannerAvatarAnimator = null;
+
     // Limit rows to visible height minus some chrome
     var MAX_ROWS = Math.max(1, console.screen_rows);
 
@@ -110,13 +178,32 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
     // putXY(header, 2, 2, "InterBBS Last Callers - FSX_DAT", TABLE_THEME.headerText);
     header.draw();
     banner.open();
-    (function loadBannerArt() {
-        var base = (typeof root !== "undefined" && root) ? root : ((typeof js === "object" && js && js.exec_dir) ? js.exec_dir : "");
-        if (base && base.charAt(base.length - 1) !== "/" && base.charAt(base.length - 1) !== "\\") base += "/";
-        banner.load(base + "last_callers.bin", banner.width, banner.height);
-    })();
+    var scriptBase = (typeof root !== "undefined" && root) ? root
+        : ((typeof js === "object" && js && js.exec_dir) ? js.exec_dir : "");
+    if (scriptBase && scriptBase.charAt(scriptBase.length - 1) !== "/" &&
+        scriptBase.charAt(scriptBase.length - 1) !== "\\") scriptBase += "/";
+    banner.load(scriptBase + "last_callers.bin", banner.width, banner.height);
     banner.draw();
     banner.top();
+    if (SUPPORTS_ANSI) {
+        glowCells = scanGlowCells(banner);
+        if (avatarLib) {
+            try {
+                var bannerAvatarModule = load({}, scriptBase + "banner-avatar-animator.js");
+                bannerAvatarAnimator = bannerAvatarModule.create({
+                    frame: banner,
+                    avatarLib: avatarLib,
+                    intervalMs: HEADER_AVATAR_INTERVAL_MS,
+                    offsetMs: HEADER_AVATAR_OFFSET_MS,
+                    dissolveMs: HEADER_AVATAR_DISSOLVE_MS,
+                    logger: function (message) { devlog(message); }
+                });
+            } catch (bannerAvatarError) {
+                devlog("banner avatar animator failed: " + bannerAvatarError);
+                bannerAvatarAnimator = null;
+            }
+        }
+    }
     footer.erase();
     footer.draw();
 
@@ -127,10 +214,13 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
     paintTable(list, view);
     parentFrame.draw();
 
-    // Loop - any key or hotspot click exits
+    // Loop - any key or hotspot click exits. cycle() only repaints changed cells,
+    // so animating is just a matter of restyling them each tick.
+    var tick = 0;
     while (!js.terminated) {
+        if (SUPPORTS_ANSI) animate(tick++);
         if (parentFrame.cycle()) console.gotoxy(console.cx > 0 ? console.cx : 1, console.cy > 0 ? console.cy : 1);
-        var k = console.inkey(K_NONE, 250);
+        var k = console.inkey(K_NONE, SUPPORTS_ANSI ? ANIM_MS : 250);
         if (!k) continue;
         break;
     }
@@ -141,18 +231,18 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
     // ---- Logic ----
 
     function fetchRows() {
-        var rows = [];
-        var dedup = Object.create(null);
+        var candidates = [];
         var nowEpoch = Math.floor(Date.now() / 1000);
         var mb = new MsgBase(SUB_CODE);
         if (!mb.open()) {
-            rows.push({ epoch: 0, alias: "<open failed: " + SUB_CODE + ">", city: "", country: "", client: "", door: "", bbs: "" });
-            return rows;
+            return [{ epoch: 0, alias: "<open failed: " + SUB_CODE + ">", city: "", country: "", client: "", door: "", bbs: "" }];
         }
         var total = mb.total_msgs | 0;
-        var start = Math.max(0, total - LOOKBACK);
+        var start = LOOKBACK > 0 ? Math.max(0, total - LOOKBACK) : 0;
 
-        // NEWEST -> OLDEST
+        // Message-number order is network receipt order, not caller time. Scan
+        // the retained set first and defer both limiting and deduplication until
+        // after candidates have been sorted by their embedded epoch.
         for (var i = total - 1; i >= start; i--) {
             var h = mb.get_msg_header(true, i); if (!h) continue;
             var from = (h.from || "").toLowerCase();
@@ -172,39 +262,52 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
                     for (var r = 0; r < parsed.length; r++) {
                         parsed[r].src_when = h.when_written_time;
                         parsed[r].src_from = h.from;
-                        if (!acceptRow(parsed[r])) continue;
-                        rows.push(parsed[r]);
-                        if (rows.length >= MAX_ROWS) break;
+                        parsed[r].src_offset = i;
+                        if (!hasPlausibleTime(parsed[r])) continue;
+                        candidates.push(parsed[r]);
                     }
                     collecting = false; buf = [];
-                    if (rows.length >= MAX_ROWS) break;
                     continue;
                 }
                 buf.push(deq);
             }
-            if (rows.length >= MAX_ROWS) break;
         }
         mb.close();
 
-        // Newest first already; if any epochs are 0, fall back to src_when
-        rows.sort(function (a, b) {
-            var ea = a.epoch || a.src_when || 0, eb = b.epoch || b.src_when || 0;
-            return eb - ea;
+        candidates.sort(function (a, b) {
+            var timeDiff = effectiveEpoch(b) - effectiveEpoch(a);
+            if (timeDiff) return timeDiff;
+            // Deterministic tie-breaker for batched rows with equal timestamps.
+            return (b.src_offset || 0) - (a.src_offset || 0);
         });
 
-        devlog("RESULT rows=" + rows.length + " max=" + MAX_ROWS);
-        return rows;
-
-        function acceptRow(row) {
-            var rowEpoch = row.epoch || row.src_when || 0;
-            if (rowEpoch > nowEpoch) return false; // skip spoofed future-dated entries
+        // Keep only the newest occurrence of each caller at each source. This
+        // must happen after the timestamp sort: receipt-order dedupe can retain
+        // an older delayed packet and discard the actual newer call.
+        var rows = [];
+        var dedup = Object.create(null);
+        for (var c = 0; c < candidates.length && rows.length < MAX_ROWS; c++) {
+            var row = candidates[c];
             var sourceDisplay = (row.bbs && row.bbs !== "") ? row.bbs : (row.src_from || "");
             var aliasKey = (row.alias || "").toLowerCase();
             var sourceKey = sourceDisplay.toLowerCase();
             var dedupeKey = aliasKey + "\x01" + sourceKey;
-            if (dedup[dedupeKey]) return false;
+            if (dedup[dedupeKey]) continue;
             dedup[dedupeKey] = true;
-            return true;
+            rows.push(row);
+        }
+
+        devlog("RESULT scanned=" + (total - start) + " candidates=" + candidates.length
+            + " unique_rows=" + rows.length + " max=" + MAX_ROWS);
+        return rows;
+
+        function effectiveEpoch(row) {
+            return row.epoch || row.src_when || 0;
+        }
+
+        function hasPlausibleTime(row) {
+            var rowEpoch = effectiveEpoch(row);
+            return rowEpoch > 0 && rowEpoch <= nowEpoch; // reject invalid/spoofed future dates
         }
     }
 
@@ -375,6 +478,12 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
         var zebra = theme.rowAttrs;
         if (SUPPORTS_HOTSPOTS) console.clear_hotspots();
 
+        shimmerCells = [];
+        var avatarW = avatarLib ? avatarLib.defs.width : 0;
+        var avatarH = avatarLib ? avatarLib.defs.height : 0;
+        var avatarsPlaced = 0;
+        var lastAvatarTop = { left: -avatarH, right: -avatarH };
+
         var cols = v.colWidths.slice(0); // copy (may shrink)
         var minCols = (v.minColWidths || []).slice(0);
         for (var c = 0; c < cols.length; c++) {
@@ -388,7 +497,13 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
             return total;
         }
 
-        var maxAllowed = Math.min(v.maxWidth || TABLE_MAX_WIDTH || cols.length, f.width);
+        // Reserve a gutter per avatar lane: one lane parks avatars on the right, two
+        // alternates them side to side so vertically-close entries don't stack up.
+        var leftGutter = (avatarLanes >= 2) ? AVATAR_GUTTER : 0;
+        var rightGutter = (avatarLanes >= 1) ? AVATAR_GUTTER : 0;
+
+        var maxAllowed = Math.min(v.maxWidth || TABLE_MAX_WIDTH || cols.length,
+            f.width - leftGutter - rightGutter);
         var totalInner = sum(cols);
         var tableWidth = totalInner + cols.length + 1;
         var targetInner = Math.max(sum(minCols), maxAllowed - (cols.length + 1));
@@ -408,10 +523,14 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
             if (!changed) break;
         }
 
-        var leftover = f.width - tableWidth;
-        var x = 1 + (leftover > 0 ? Math.floor(leftover / 2) : 0);
+        var leftover = f.width - (leftGutter + tableWidth + rightGutter);
+        var x = 1 + leftGutter + (leftover > 0 ? Math.floor(leftover / 2) : 0);
         var y = 1;
         var innerWidth = tableWidth - 2;
+
+        // 1-based frame column where each cell's text begins (past its left border)
+        var colX = [];
+        for (var cx = x + 1, ci = 0; ci < cols.length; ci++) { colX.push(cx); cx += cols[ci] + 1; }
 
         function border(kind) {
             var parts;
@@ -446,10 +565,65 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
                 loc,
                 source
             ];
+            var padded = [];
             var s = cp.vert;
-            for (var i = 0; i < cols.length; i++) s += clipPad(cells[i], cols[i]) + cp.vert;
-            var attr = isOwnBbs(source) ? OWN_ROW_ATTR : zebra[idx % zebra.length];
-            putXY(f, x, y, s, attr); y++;
+            for (var i = 0; i < cols.length; i++) {
+                padded[i] = clipPad(cells[i], cols[i]);
+                s += padded[i] + cp.vert;
+            }
+            var own = isOwnBbs(source);
+            var attr = own ? OWN_ROW_ATTR : zebra[idx % zebra.length];
+            putXY(f, x, y, s, attr);
+
+            // Locals get the rainbow treatment on their name and home board, plus an avatar
+            // in the gutter if the terminal is wide enough to spare one.
+            if (own && SUPPORTS_ANSI) {
+                addShimmer(padded[COL_ALIAS], colX[COL_ALIAS], y);
+                addShimmer(padded[COL_SOURCE], colX[COL_SOURCE], y);
+                placeAvatar(f, row, y);
+            }
+            y++;
+        }
+
+        // Queue the non-blank characters of a cell; each gets a phase so the rainbow
+        // travels along the run instead of flashing it as a block.
+        function addShimmer(text, cellX, rowY) {
+            for (var i = 0; i < text.length; i++) {
+                var ch = text.charAt(i);
+                if (ch === " ") continue;   // a foreground color on a blank cell shows nothing
+                shimmerCells.push({ x: cellX - 1 + i, y: rowY - 1, ch: ch, phase: i });
+            }
+        }
+
+        function placeAvatar(frame, row, rowY) {
+            if (!avatarLanes) return;
+            var bin = lookupAvatar(row.alias);
+            if (!bin) return;
+
+            var side = (avatarLanes >= 2 && (avatarsPlaced % 2 === 1)) ? "left" : "right";
+            avatarsPlaced++;
+
+            // Center the avatar on its row, then keep it inside the frame.
+            var top = rowY - Math.floor(avatarH / 2);
+            if (top < 1) top = 1;
+            if (top + avatarH - 1 > frame.height) top = frame.height - avatarH + 1;
+            if (top < 1) return;                          // frame too short to hold one
+            if (top - lastAvatarTop[side] < avatarH) return;  // would overlap this side's last avatar
+            lastAvatarTop[side] = top;
+
+            var ax = (side === "left") ? (x - avatarW - 1) : (x + tableWidth + 1);
+            if (ax < 1 || ax + avatarW - 1 > frame.width) return;
+            blitAvatar(frame, bin, ax, top);
+        }
+
+        function blitAvatar(frame, bin, ax, ay) {
+            for (var ry = 0; ry < avatarH; ry++) {
+                for (var rx = 0; rx < avatarW; rx++) {
+                    var p = ((ry * avatarW) + rx) * 2;
+                    var ch = bin.charAt(p);
+                    frame.setData(ax - 1 + rx, ay - 1 + ry, ch === "\x00" ? " " : ch, bin.charCodeAt(p + 1), false);
+                }
+            }
         }
 
         // Top lines
@@ -476,6 +650,71 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
 
         f.draw();
         installExitHotspots(parentFrame);
+    }
+
+    // ---- EYE CANDY ----
+
+    // Local callers only, so the avatar always comes from our own user base.
+    function lookupAvatar(alias) {
+        var key = normalizeName(alias);
+        if (!key || !avatarLib) return null;
+        if (key in avatarCache) return avatarCache[key];
+        var bin = null;
+        try {
+            var usernum = system.matchuser(alias);
+            if (usernum) {
+                var obj = avatarLib.read(usernum, alias);
+                if (avatarLib.is_enabled(obj)) bin = base64_decode(obj.data);
+            }
+        } catch (e) { devlog("avatar lookup failed for " + alias + ": " + e); }
+        if (bin && bin.length < avatarLib.defs.width * avatarLib.defs.height * 2) bin = null;
+        avatarCache[key] = bin;
+        return bin;
+    }
+
+    // The banner art draws its lettering in bright red; collect those cells so the
+    // animator can cycle them through GLOW_COLORS.
+    function scanGlowCells(frame) {
+        var cells = [];
+        try {
+            for (var gy = 0; gy < frame.height; gy++) {
+                for (var gx = 0; gx < frame.width; gx++) {
+                    var cell = frame.getData(gx, gy, false);
+                    if (!cell || cell.ch === undefined || cell.attr === undefined) continue;
+                    // The rotating bookends own these cells; the red-letter
+                    // glow must never repaint avatar palette data behind them.
+                    if (gx < HEADER_AVATAR_WIDTH || gx >= frame.width - HEADER_AVATAR_WIDTH) continue;
+                    if ((cell.attr & 0x0F) !== GLOW_SOURCE_FG) continue;
+                    cells.push({ x: gx, y: gy, ch: cell.ch, bg: cell.attr & 0xF0 });
+                }
+            }
+        } catch (e) { devlog("glow scan failed: " + e); }
+        devlog("glow cells=" + cells.length);
+        return cells;
+    }
+
+    function animate(tick) {
+        var i, c, attr;
+        for (i = 0; i < shimmerCells.length; i++) {
+            c = shimmerCells[i];
+            if (((c.phase * 7 + tick) % SHIMMER_SPARKLE_MOD) === 0) {
+                attr = SHIMMER_SPARKLE | BG_BLACK;
+            } else {
+                // Subtracting the tick walks the wave along the run, left to right.
+                var si = (c.phase - tick) % SHIMMER_COLORS.length;
+                if (si < 0) si += SHIMMER_COLORS.length;
+                attr = SHIMMER_COLORS[si] | BG_BLACK;
+            }
+            list.setData(c.x, c.y, c.ch, attr, false);
+        }
+
+        // The whole banner pulses as one: every glow cell takes the same color this tick.
+        var glow = GLOW_CYCLE[tick % GLOW_CYCLE.length];
+        for (i = 0; i < glowCells.length; i++) {
+            c = glowCells[i];
+            banner.setData(c.x, c.y, c.ch, glow | c.bg, false);
+        }
+        if (bannerAvatarAnimator) bannerAvatarAnimator.tick(Date.now());
     }
 
     // tiny utils
