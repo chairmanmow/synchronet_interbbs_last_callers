@@ -5,6 +5,17 @@
 load("sbbsdefs.js");
 load("frame.js");
 
+// Probe before drawing anything. Ordinary terminals fail the cheap CTerm
+// pre-filter in scene3d.js and never see a byte of the 3DS protocol.
+var Scene3dMod = null;
+var Scene3dVersion = null;
+try {
+    Scene3dMod = load("/sbbs/mods/load/scene3d.js");
+    Scene3dVersion = Scene3dMod.probe(500);
+} catch (e) {
+    try { log(LOG_WARNING, "interbbs-last-callers scene3d unavailable: " + e); } catch (_) { }
+}
+
 // --- Config ---
 var test = "LOCAL-TEST_ADS".toLowerCase();
 var SUB_CODE = "fsx_dat";
@@ -171,6 +182,39 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
     var bannerX = Math.max(1, Math.floor((header.width - bannerW) / 2) + 1); // center, 1-based
     var banner = new Frame(bannerX, 1, bannerW, header.height, WHITE | BG_GREEN, header);
 
+    // The caller wall reads like a physical departure board: the animated
+    // masthead is closest, the table sits in front of its cabinet, and the
+    // header/footer rails bridge the two. Keep layer zero at the glass for
+    // raw cursor output and anything scene3d does not recognize.
+    var depthLayers = null;
+    if (Scene3dMod && Scene3dMod.supportsTextLayers(Scene3dVersion)) {
+        var layers = new Scene3dMod.TextDepthLayers({
+            spread: 3.4,
+            order: ['glass', 'masthead', 'chrome', 'callers', 'backdrop'],
+            depths: {
+                glass: 0.0,
+                masthead: 0.08,
+                chrome: 0.26,
+                callers: 0.48,
+                backdrop: 1.0
+            },
+            bandFor: function (frame) {
+                var node = frame;
+                for (var hops = 0; node && hops < 6; hops++) {
+                    if (node === banner) return 'masthead';
+                    if (node === header || node === footer) return 'chrome';
+                    if (node === list) return 'callers';
+                    if (node === parentFrame) return 'backdrop';
+                    try { node = node.parent; } catch (e) { return 'glass'; }
+                }
+                return 'glass';
+            },
+            log: function (message) { devlog(message); }
+        });
+        if (layers.install(typeof Display !== "undefined" ? Display : null)) depthLayers = layers;
+    }
+
+    try {
     parentFrame.open();
 
     // Static chrome (ASCII)
@@ -225,7 +269,13 @@ function toEpoch(s) { var n = parseInt(s, 10); return isNaN(n) ? 0 : n; }
         break;
     }
 
-    parentFrame.close();
+    } finally {
+        try { parentFrame.close(); } catch (e) { }
+        if (depthLayers) {
+            try { depthLayers.dispose(); } catch (e2) { }
+            depthLayers = null;
+        }
+    }
     return;
 
     // ---- Logic ----
